@@ -1,0 +1,431 @@
+# UDX710 后台管理系统 —— 自动化构建 / 打包 / 发布流水线
+#
+# 为什么单独建这个文件：
+#   仓库里已有的 .github/workflows/build-ota.yml 只能 workflow_dispatch 手动点，
+#   而且不产出「裸二进制」和「前端产物」这两样单独可用的东西。
+#   本文件负责：push / PR 自动构建校验 + 产出可下载产物 + 打 tag 自动发 Release。
+#
+# 目标平台：aarch64-unknown-linux-musl（设备是 ARM64 + musl，静态链接，不依赖 glibc）
+# Runner：ubuntu-24.04-arm（原生 ARM64，公开仓库免费；比在 x86 上交叉编译少踩 musl 的坑）
+#
+# 产物（release/ 目录，同时作为 artifact 上传）：
+#   udx710                              # 后端静态二进制（已 strip，可选 UPX）
+#   udx710-frontend-<ver>.tar.gz        # 前端 dist 单独打包
+#   udx710-ota-<ver>.tar.gz             # 设备 OTA 包：meta.json + udx710 + www/
+#   SHA256SUMS.txt                      # 发布文件校验和
+#
+# OTA 包的 MD5 算法严格对齐 backend/src/ota.rs::calculate_directory_md5，
+# 打包后会用 Python 按设备端同样的规则重新解包复算一遍，避免「下载得到但设备拒装」。
+
+name: Build Artifacts
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      use_upx:
+        description: "使用 UPX 压缩后端二进制（体积更小，设备端自解压运行）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_TARGET: aarch64-unknown-linux-musl
+  BIN_NAME: udx710
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Backend + Frontend + OTA
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # build.rs 会调用 git rev-parse 注入 GIT_COMMIT，tag 构建也要能读到历史
+          fetch-depth: 0
+
+      - name: Resolve build options
+        id: opts
+        run: |
+          set -euo pipefail
+          USE_UPX="true"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            USE_UPX="${{ inputs.use_upx }}"
+          fi
+          echo "use_upx=$USE_UPX" >> "$GITHUB_OUTPUT"
+          echo "UPX 压缩: $USE_UPX"
+
+      - name: Read VERSION
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::VERSION 文件为空"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号: $VERSION"
+
+      - name: Validate version consistency
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.value }}"
+          BACKEND_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' backend/Cargo.toml | head -n1)"
+          FRONTEND_VERSION="$(python3 -c 'import json;print(json.load(open("frontend/package.json"))["version"])')"
+
+          echo "根目录 VERSION            = $VERSION"
+          echo "backend/Cargo.toml        = $BACKEND_VERSION"
+          echo "frontend/package.json     = $FRONTEND_VERSION"
+
+          STRICT="false"
+          case "$GITHUB_REF" in
+            refs/tags/*) STRICT="true" ;;
+          esac
+
+          FAIL=0
+          if [ "$BACKEND_VERSION" != "$VERSION" ]; then
+            echo "::error::backend/Cargo.toml 版本 ($BACKEND_VERSION) 与 VERSION ($VERSION) 不一致"
+            FAIL=1
+          fi
+          if [ "$FRONTEND_VERSION" != "$VERSION" ]; then
+            echo "::error::frontend/package.json 版本 ($FRONTEND_VERSION) 与 VERSION ($VERSION) 不一致"
+            FAIL=1
+          fi
+          if [ "$STRICT" = "true" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VERSION" != "$VERSION" ]; then
+              echo "::error::tag ($GITHUB_REF_NAME) 与 VERSION ($VERSION) 不一致，OTA 升级判定会错乱"
+              FAIL=1
+            fi
+          elif [ "$FAIL" = "1" ]; then
+            echo "::warning::非 tag 构建，版本不一致只告警不中断；发版前请同步 scripts/build.sh 的版本同步逻辑"
+            FAIL=0
+          fi
+          exit "$FAIL"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools upx-ucl file
+          musl-gcc --version | head -n1
+          upx --version | head -n1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend -> target
+          cache-targets: true
+          cache-all-crates: true
+
+      - name: Build backend (${{ env.RUST_TARGET }})
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          # backend/.cargo/config.toml 里写死了 macOS 侧的 aarch64-unknown-linux-musl-gcc，
+          # 在 Ubuntu ARM64 上不存在；用环境变量覆盖成 musl-gcc（env 优先级高于 config）。
+          export CC_aarch64_unknown_linux_musl=musl-gcc
+          export CC_AARCH64_UNKNOWN_LINUX_MUSL=musl-gcc
+          export AR_aarch64_unknown_linux_musl=ar
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          # rusqlite 走 bundled，强制静态编译 sqlite3，防止把 runner 上的 libsqlite3 混进来
+          export SQLITE3_STATIC=1
+          export LIBSQLITE3_SYS_USE_PKG_CONFIG=0
+
+          cargo build --locked --release --target "$RUST_TARGET"
+
+          BIN="target/${RUST_TARGET}/release/${BIN_NAME}"
+          ls -lh "$BIN"
+          file "$BIN"
+
+      - name: Compress binary with UPX
+        if: steps.opts.outputs.use_upx == 'true'
+        run: |
+          set -euo pipefail
+          BIN="backend/target/${RUST_TARGET}/release/${BIN_NAME}"
+          BEFORE="$(stat -c%s "$BIN")"
+          upx --best --lzma "$BIN"
+          AFTER="$(stat -c%s "$BIN")"
+          RATIO="$(awk -v before="$BEFORE" -v after="$AFTER" 'BEGIN { printf "%.1f", 100 - (after * 100 / before) }')"
+          echo "UPX: ${BEFORE} -> ${AFTER} bytes，节省 ${RATIO}%"
+          ls -lh "$BIN"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --prefer-offline
+          # package.json 的 build = pnpm lint && vite build，lint 挂了这里就会红
+          pnpm run build
+          if [ ! -f dist/index.html ]; then
+            echo "::error::前端构建产物缺少 dist/index.html"
+            exit 1
+          fi
+          ls -lh dist/
+
+      - name: Package artifacts
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.value }}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          BIN="backend/target/${RUST_TARGET}/release/${BIN_NAME}"
+          DIST="frontend/dist"
+          OUT="release"
+          STAGE="$(mktemp -d)"
+          trap 'rm -rf "$STAGE"' EXIT
+
+          if [ ! -f "$BIN" ]; then
+            echo "::error::后端二进制缺失: $BIN"
+            exit 1
+          fi
+          if [ ! -f "$DIST/index.html" ]; then
+            echo "::error::前端产物缺失: $DIST/index.html"
+            exit 1
+          fi
+
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          cp "$BIN" "$OUT/${BIN_NAME}"
+          chmod 755 "$OUT/${BIN_NAME}"
+
+          # OTA 暂存目录：结构必须与 ota.rs 的解析路径一致（根下 meta.json / udx710 / www）
+          mkdir -p "$STAGE/www"
+          cp "$BIN" "$STAGE/${BIN_NAME}"
+          chmod 755 "$STAGE/${BIN_NAME}"
+          cp -R "$DIST/." "$STAGE/www/"
+
+          # meta.json 与两个 MD5 统一交给 Python 生成，算法与 backend/src/ota.rs 一一对应，
+          # 避免不同平台 md5sum 的转义差异导致设备端拒装
+          python3 - "$STAGE" "$VERSION" "$COMMIT" "$BUILD_TIME" "$RUST_TARGET" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+
+          stage, version, commit, build_time, arch = sys.argv[1:6]
+
+
+          def file_md5(path):
+              with open(path, "rb") as fh:
+                  return hashlib.md5(fh.read()).hexdigest()
+
+
+          # ota.rs::calculate_directory_md5：所有文件 md5 -> 排序 -> 每行一个 -> 末尾补 \n -> 再 md5
+          digests = []
+          for dirpath, _dirnames, filenames in os.walk(os.path.join(stage, "www")):
+              for fname in filenames:
+                  digests.append(file_md5(os.path.join(dirpath, fname)))
+          digests.sort()
+          payload = "\n".join(digests)
+          if payload:
+              payload += "\n"
+
+          meta = {
+              "version": version,
+              "commit": commit,
+              "build_time": build_time,
+              "binary_md5": file_md5(os.path.join(stage, "udx710")),
+              "frontend_md5": hashlib.md5(payload.encode()).hexdigest(),
+              "arch": arch,
+          }
+          with open(os.path.join(stage, "meta.json"), "w", encoding="utf-8") as fh:
+              json.dump(meta, fh, indent=2, ensure_ascii=False)
+              fh.write("\n")
+          print(json.dumps(meta, indent=2))
+          PY
+
+          read_meta() {
+            python3 -c 'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8"))[sys.argv[2]])' "$STAGE/meta.json" "$1"
+          }
+          BINARY_MD5="$(read_meta binary_md5)"
+          FRONTEND_MD5="$(read_meta frontend_md5)"
+
+          # 用 -C 指定打包根目录，避免绝对路径被 GNU tar 当成 host:path 解析
+          tar -czf "$OUT/${BIN_NAME}-ota-${VERSION}.tar.gz" -C "$STAGE" meta.json "${BIN_NAME}" www
+          tar -czf "$OUT/${BIN_NAME}-frontend-${VERSION}.tar.gz" -C "$DIST" .
+          ( cd "$OUT" && sha256sum * > SHA256SUMS.txt )
+
+          OTA_FILE="$OUT/${BIN_NAME}-ota-${VERSION}.tar.gz"
+          OTA_MD5="$(python3 -c 'import hashlib,sys;print(hashlib.md5(open(sys.argv[1],"rb").read()).hexdigest())' "$OTA_FILE")"
+          {
+            echo "ota_file=$OTA_FILE"
+            echo "ota_md5=$OTA_MD5"
+            echo "ota_size=$(stat -c%s "$OTA_FILE")"
+            echo "binary_md5=$BINARY_MD5"
+            echo "frontend_md5=$FRONTEND_MD5"
+            echo "commit=$COMMIT"
+            echo "build_time=$BUILD_TIME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "---- release/ ----"
+          ls -lh "$OUT"
+          echo "---- SHA256SUMS ----"
+          cat "$OUT/SHA256SUMS.txt"
+
+      - name: Verify OTA package
+        env:
+          OTA_FILE: ${{ steps.package.outputs.ota_file }}
+          EXPECT_VERSION: ${{ steps.version.outputs.value }}
+          EXPECT_ARCH: ${{ env.RUST_TARGET }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import stat
+          import tarfile
+          import tempfile
+
+          REQUIRED = ("version", "commit", "build_time", "binary_md5", "frontend_md5", "arch")
+
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              raise SystemExit(1)
+
+
+          ota = pathlib.Path(os.environ["OTA_FILE"])
+          expect_version = os.environ["EXPECT_VERSION"]
+          expect_arch = os.environ["EXPECT_ARCH"]
+
+          if not ota.is_file():
+              fail(f"OTA 包不存在: {ota}")
+
+          with tempfile.TemporaryDirectory() as tmp:
+              with tarfile.open(ota, "r:gz") as tf:
+                  try:
+                      tf.extractall(tmp, filter="fully_trusted")
+                  except TypeError:
+                      tf.extractall(tmp)
+
+              root = pathlib.Path(tmp)
+              for name in ("meta.json", "udx710", "www"):
+                  if not (root / name).exists():
+                      fail(f"OTA 包缺少 {name}")
+              if not (root / "www" / "index.html").is_file():
+                  fail("www/index.html 不存在，设备端会当成空前端")
+
+              meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+              for key in REQUIRED:
+                  if not str(meta.get(key, "")).strip():
+                      fail(f"meta.json 字段缺失或为空: {key}")
+
+              if meta["version"] != expect_version:
+                  fail(f"版本不一致: meta={meta['version']} expect={expect_version}")
+              if meta["arch"] != expect_arch:
+                  fail(f"架构不一致: meta={meta['arch']} expect={expect_arch}")
+
+              bin_md5 = hashlib.md5((root / "udx710").read_bytes()).hexdigest()
+              if bin_md5 != meta["binary_md5"]:
+                  fail(f"二进制 MD5 不匹配: meta={meta['binary_md5']} actual={bin_md5}")
+
+              # 复刻 ota.rs::calculate_directory_md5
+              digests = []
+              for dirpath, _dirnames, filenames in os.walk(root / "www"):
+                  for fname in filenames:
+                      with open(os.path.join(dirpath, fname), "rb") as fh:
+                          digests.append(hashlib.md5(fh.read()).hexdigest())
+              digests.sort()
+              payload = "\n".join(digests)
+              if payload:
+                  payload += "\n"
+              fe_md5 = hashlib.md5(payload.encode()).hexdigest()
+              if fe_md5 != meta["frontend_md5"]:
+                  fail(f"前端 MD5 不匹配: meta={meta['frontend_md5']} actual={fe_md5}")
+
+              mode = stat.S_IMODE((root / "udx710").stat().st_mode)
+              if not mode & 0o111:
+                  fail(f"udx710 缺少执行权限 (mode={oct(mode)})")
+
+              print(f"OK version={meta['version']} commit={meta['commit']} arch={meta['arch']}")
+              print(f"OK binary_md5={bin_md5}")
+              print(f"OK frontend_md5={fe_md5} ({len(digests)} files)")
+              print("OTA 包可以直传 /api/ota/upload")
+          PY
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: udx710-${{ steps.version.outputs.value }}-${{ github.sha }}
+          path: release/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v6
+        with:
+          name: udx710-frontend-${{ steps.version.outputs.value }}
+          path: frontend/dist
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/udx710
+            release/*.tar.gz
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## UDX710 构建产物"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 版本 | ${{ steps.version.outputs.value }} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+            echo "| 架构 | ${RUST_TARGET} |"
+            echo "| UPX | ${{ steps.opts.outputs.use_upx }} |"
+            echo "| 二进制 MD5 | ${{ steps.package.outputs.binary_md5 }} |"
+            echo "| 前端 MD5 | ${{ steps.package.outputs.frontend_md5 }} |"
+            echo "| OTA 包 | ${{ steps.package.outputs.ota_file }} |"
+            echo ""
+            echo "### 设备 OTA 安装"
+            echo '```bash'
+            echo "curl -X POST http://192.168.66.1:3000/api/ota/upload \\"
+            echo "  -H 'Content-Type: application/octet-stream' \\"
+            echo "  --data-binary @udx710-ota-${{ steps.version.outputs.value }}.tar.gz"
+            echo "curl -X POST http://192.168.66.1:3000/api/ota/apply \\"
+            echo "  -H 'Content-Type: application/json' \\"
+            echo "  -d '{\"restart_now\":true}'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
